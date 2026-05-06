@@ -124,7 +124,7 @@ public class DatabaseManager implements AutoCloseable {
      * 添加一行数据到批处理
      */
     public void addBatch(TableEnum table, Map row) throws SQLException {
-        logger.info("添加批处理数据: {}", row);
+        logger.debug("添加批处理数据到 {}: {}", table.name(), row);
         TableConfig tableConfig = TableCache.getTableConfig(table);
         String hosCode = (String) row.get("hos_code");
         String batchId = (String) row.get("batch_id");
@@ -209,6 +209,7 @@ public class DatabaseManager implements AutoCloseable {
         List<Map<String, Object>> resultList = new ArrayList<>();
 
         try (PreparedStatement stmt = connection.prepareStatement(sql)) {
+            stmt.setFetchSize(Math.max(batchSize, 1000));
             if (CollectionUtils.isNotEmpty( params)) {
                 for (int i = 0; i < params.size(); i++) {
                     Object param = params.get(i);
