@@ -17,7 +17,7 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * @Author: RedFlag
  * @CreateTime: 2025-08-20  15:05
- * @Description: dwd_fee_sum_group_mrhp -> cost_detail (时间窗口优化版)
+ * @Description: dwd_fee_sum_group_mrhp -> cost_detail
  */
 @Slf4j
 public class DwdFeeProcessor implements DataProcessor {
@@ -160,32 +160,31 @@ public class DwdFeeProcessor implements DataProcessor {
      */
     private int processWindow(LocalDateTime windowStart, LocalDateTime windowEnd, int processedBase) {
         try {
-            List<Map<String, Object>> dwdFeeRows = dbManager.querySql(
+            log.info("开始流式处理时间窗口 {} ~ {}", windowStart, windowEnd);
+
+            int[] windowProcessed = {0};
+            dbManager.querySqlStream(
                     querySql,
-                    Arrays.asList(Timestamp.valueOf(windowStart), Timestamp.valueOf(windowEnd))
+                    Arrays.asList(Timestamp.valueOf(windowStart), Timestamp.valueOf(windowEnd)),
+                    rawRow -> {
+                        processRow(rawRow);
+                        windowProcessed[0]++;
+                        int count = processedBase + windowProcessed[0];
+                        if (count % BATCH_COMMIT_SIZE == 0) {
+                            dbManager.executeAllBatch();
+                            log.info("已处理 {} 条记录", count);
+                        }
+                    }
             );
-            if (dwdFeeRows.isEmpty()) {
+
+            if (windowProcessed[0] == 0) {
                 return 0;
             }
 
-            log.info("开始处理时间窗口 {} ~ {}，共 {} 条",
-                    windowStart, windowEnd, dwdFeeRows.size());
-
-            int windowProcessed = 0;
-            for (Map<String, Object> rawRow : dwdFeeRows) {
-                processRow(rawRow);
-                windowProcessed++;
-                int count = processedBase + windowProcessed;
-                if (count % BATCH_COMMIT_SIZE == 0) {
-                    dbManager.executeAllBatch();
-                    log.info("已处理 {} 条记录", count);
-                }
-            }
-
             log.info("完成时间窗口 {} ~ {} 的处理，共 {} 条",
-                    windowStart, windowEnd, windowProcessed);
+                    windowStart, windowEnd, windowProcessed[0]);
 
-            return windowProcessed;
+            return windowProcessed[0];
         } catch (Exception e) {
             log.error("处理时间窗口 {} ~ {} 时发生异常", windowStart, windowEnd, e);
             throw new RuntimeException("处理时间窗口数据失败", e);
@@ -197,7 +196,8 @@ public class DwdFeeProcessor implements DataProcessor {
      */
     private void processRow(Map<String, Object> rawRow) {
         Map<String, String> row = new HashMap<>();
-        row.put("pid", safeToString(rawRow.get("pid")));
+        rawRow.forEach((k, v) -> row.put(k, safeToString(v)));
+
         row.put("feecode", safeToString(rawRow.get("item_code")));
         row.put("feename", safeToString(rawRow.get("item_name")));
         row.put("itemclasscode", safeToString(rawRow.get("item_class_code")));
@@ -208,12 +208,12 @@ public class DwdFeeProcessor implements DataProcessor {
         row.put("source_flag", "");
         row.put("hos_code", safeToString(rawRow.get("clean_hospital_code")));
 
-        String hosCode = row.get("hos_code");
+        String hosCode = row.getOrDefault("clean_hospital_code", "");
         String hosName = Optional.ofNullable(HospitalCache.getHospitalName(hosCode)).orElse(hosCode);
         row.put("batch_name", hosName + "_" + batchDate);
-        row.put("batch_id", safeToString(rawRow.get("config_id")));
+        row.put("batch_id", row.get("config_id"));
 
-        String mappingKey = buildMappingKey(rawRow.get("item_code"), rawRow.get("item_class_code"));
+        String mappingKey = buildMappingKey(row.get("item_code"), row.get("item_class_code"));
         Map<String, Object> mapping = mappingCache.get(mappingKey);
 
         if (mapping != null) {
@@ -231,7 +231,7 @@ public class DwdFeeProcessor implements DataProcessor {
             row.put("ins_nation_project_code", row.get("feecode"));
             row.put("ins_nation_project_name", row.get("feename"));
             row.put("mija_project_code", row.get("feecode"));
-            row.put("mija_project_name", row.get("feename"));
+            row.put("mija_project_name", row.get("feecode"));
         }
 
         row.put("created_at", LocalDateTime.now().format(DATETIME_FORMATTER));
