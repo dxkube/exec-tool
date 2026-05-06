@@ -1,0 +1,11 @@
+java -jar target/file-processor-1.0-SNAPSHOT-jar-with-dependencies.jar D:\turkey-data\漳州市漳州医院_202502
+
+
+
+
+
+ java -jar target/file-processor-1.0-SNAPSHOT-jar-with-dependencies.jar D:\turkey-data\石河子大学第一附属医院_202408  --出错了 io异常
+
+
+ 南京市儿童医院    天津市天津医院  江苏省省级机关医院  浙江大学医学院附属第二医院  漳州市医院龙文院区  石河子大学医学院第一附属医院
+  苏州大学附属第二医院
