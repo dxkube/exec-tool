@@ -25,6 +25,11 @@ import java.util.*;
 public class DatabaseManager implements AutoCloseable {
     private static final Logger logger = LoggerFactory.getLogger(DatabaseManager.class);
 
+    @FunctionalInterface
+    public interface RowHandler {
+        void handle(Map<String, Object> row) throws SQLException;
+    }
+
     private final String dbUrl;
     private final String dbUser;
     private final String dbPassword;
@@ -124,7 +129,7 @@ public class DatabaseManager implements AutoCloseable {
      * 添加一行数据到批处理
      */
     public void addBatch(TableEnum table, Map row) throws SQLException {
-        logger.info("添加批处理数据: {}", row);
+        logger.debug("添加批处理数据到 {}: {}", table.name(), row);
         TableConfig tableConfig = TableCache.getTableConfig(table);
         String hosCode = (String) row.get("hos_code");
         String batchId = (String) row.get("batch_id");
@@ -209,6 +214,7 @@ public class DatabaseManager implements AutoCloseable {
         List<Map<String, Object>> resultList = new ArrayList<>();
 
         try (PreparedStatement stmt = connection.prepareStatement(sql)) {
+            stmt.setFetchSize(Math.max(batchSize, 1000));
             if (CollectionUtils.isNotEmpty( params)) {
                 for (int i = 0; i < params.size(); i++) {
                     Object param = params.get(i);
@@ -241,6 +247,53 @@ public class DatabaseManager implements AutoCloseable {
         }
 
         return resultList;
+    }
+
+    /**
+     * 以流式方式执行查询，适合超大结果集，避免一次性加载到内存。
+     * 使用独立只读连接，避免与批量写入共用连接导致游标被打断。
+     */
+    @SneakyThrows
+    public void querySqlStream(String sql, List<Object> params, RowHandler rowHandler) {
+        try (Connection queryConnection = DriverManager.getConnection(dbUrl, dbUser, dbPassword)) {
+            queryConnection.setAutoCommit(false);
+            queryConnection.setReadOnly(true);
+
+            try (PreparedStatement stmt = queryConnection.prepareStatement(sql)) {
+                stmt.setFetchSize(Math.max(batchSize, 1000));
+                if (CollectionUtils.isNotEmpty(params)) {
+                    for (int i = 0; i < params.size(); i++) {
+                        Object param = params.get(i);
+                        if (param == null) {
+                            stmt.setNull(i + 1, Types.NULL);
+                        } else {
+                            stmt.setObject(i + 1, param);
+                        }
+                    }
+                }
+
+                logger.info("流式执行查询 SQL: {}", sql);
+                try (ResultSet rs = stmt.executeQuery()) {
+                    ResultSetMetaData metaData = rs.getMetaData();
+                    int columnCount = metaData.getColumnCount();
+
+                    while (rs.next()) {
+                        Map<String, Object> row = new HashMap<>(columnCount);
+                        for (int i = 1; i <= columnCount; i++) {
+                            String columnName = metaData.getColumnLabel(i);
+                            Object value = rs.getObject(i);
+                            row.put(columnName, value);
+                        }
+                        rowHandler.handle(row);
+                    }
+                }
+            } finally {
+                queryConnection.rollback();
+            }
+        } catch (SQLException e) {
+            logger.error("流式查询 SQL 失败: {}", sql, e);
+            throw e;
+        }
     }
 
 
