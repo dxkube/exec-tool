@@ -23,7 +23,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class DwdFeeProcessor implements DataProcessor {
 
     private static final int QUERY_WINDOW_HOURS = 1;
-    private static final int BATCH_COMMIT_SIZE = 100000;
+    private static final int BATCH_COMMIT_SIZE = 1000;
     private static final DateTimeFormatter DATETIME_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private static final DateTimeFormatter BATCH_FORMATTER = DateTimeFormatter.ofPattern("yyyyMM");
 
@@ -253,14 +253,13 @@ public class DwdFeeProcessor implements DataProcessor {
         String[] columns = TableEnum.cost_detail.getColumns();
         Set<String> columnSet = new HashSet<>(Arrays.asList(columns));
         Iterator<Map.Entry<String, String>> iterator = row.entrySet().iterator();
-        while (iterator.hasNext()) {
-            Map.Entry<String, String> entry = iterator.next();
-            if ("hos_code".equals(entry.getKey())){
-                continue;
-            }
-            if (!columnSet.contains(entry.getKey())) {
+
+        while(iterator.hasNext()) {
+            Map.Entry<String, String> entry = (Map.Entry)iterator.next();
+            if (!"hos_code".equals(entry.getKey()) && !columnSet.contains(entry.getKey())) {
                 iterator.remove();
             }
         }
+
     }
 }
