@@ -19,6 +19,7 @@ tables:
       - name: hos_code
       - name: batch_id
       - name: batch_name
+      - name: fee_list
   - name: group_param
     description: "质控分组参数"
     columns:
@@ -39,6 +40,7 @@ tables:
       - name: hos_code
       - name: batch_id
       - name: batch_name
+      - name: fee_list
 
   - name: cost_mapping_aggregation
     description: "费用映射聚合表"

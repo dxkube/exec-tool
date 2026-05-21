@@ -197,6 +197,47 @@ public class DatabaseManager implements AutoCloseable {
     public void executeAllBatch() {
             preparedStatements.keySet().forEach(this::executeBatch);
     }
+
+    /**
+     * Batch-executes parameterized UPDATE statements in a single round-trip.
+     *
+     * Each element in paramsList is an Object[] of [param1, param2, ...] bound
+     * positionally to the placeholders in sql.
+     *
+     * Using PreparedStatement.addBatch() + executeBatch() avoids N individual
+     * network round-trips and lets PostgreSQL pipeline the statements efficiently.
+     */
+    public void batchUpdateFeeList(String sql, List<Object[]> paramsList) throws SQLException {
+        if (paramsList.isEmpty()) {
+            return;
+        }
+        if (connection == null || connection.isClosed()) {
+            connection = DriverManager.getConnection(dbUrl, dbUser, dbPassword);
+            connection.setAutoCommit(false);
+        }
+        try (PreparedStatement stmt = connection.prepareStatement(sql)) {
+            for (Object[] params : paramsList) {
+                // params[0] is a JSON array string that must reach PostgreSQL as jsonb.
+                // setString() sends it as text, which causes "operator does not exist: jsonb || text".
+                // PGobject with type "jsonb" makes the driver send the correct OID.
+                org.postgresql.util.PGobject jsonbValue = new org.postgresql.util.PGobject();
+                jsonbValue.setType("jsonb");
+                jsonbValue.setValue((String) params[0]);
+                stmt.setObject(1, jsonbValue);
+                // remaining params (pid, batch_id) are plain strings
+                for (int i = 1; i < params.length; i++) {
+                    stmt.setString(i + 1, (String) params[i]);
+                }
+                stmt.addBatch();
+            }
+            stmt.executeBatch();
+            connection.commit();
+            logger.info("批量更新完成，共 {} 行", paramsList.size());
+        } catch (SQLException e) {
+            logger.error("批量更新失败，SQL: {}", sql, e);
+            throw e;
+        }
+    }
     /**
      * 执行查询 SQL 并返回结果
      * @param sql 查询语句

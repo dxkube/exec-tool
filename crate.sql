@@ -66,6 +66,7 @@ CREATE TABLE group_param (
                  IRPDID VARCHAR(255),
                  hos_code VARCHAR(255),
                  batch_id VARCHAR(255),
+                 fee_list JSONB,
                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 

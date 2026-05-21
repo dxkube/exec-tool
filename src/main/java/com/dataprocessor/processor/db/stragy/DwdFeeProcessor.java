@@ -1,9 +1,11 @@
 package com.dataprocessor.processor.db.stragy;
 
+import com.alibaba.fastjson.JSON;
 import com.dataprocessor.db.DatabaseManager;
 import com.dataprocessor.processor.TableEnum;
 import com.dataprocessor.processor.db.DataProcessor;
 import com.dataprocessor.util.HospitalCache;
+import com.dataprocessor.util.StringToUUID;
 import lombok.extern.slf4j.Slf4j;
 
 import java.sql.SQLException;
@@ -17,15 +19,19 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * @Author: RedFlag
  * @CreateTime: 2025-08-20  15:05
- * @Description: dwd_fee_sum_group_mrhp -> cost_detail
+ * @Description: dwd_fee_sum_group_mrhp -> group_param.fee_list (JSONB)
+ * 映射结果不再写入 cost_detail，改为按 (pid, batch_id) 分组后批量更新 group_param.fee_list
  */
 @Slf4j
 public class DwdFeeProcessor implements DataProcessor {
 
-    private static final int QUERY_WINDOW_HOURS = 1;
-    private static final int BATCH_COMMIT_SIZE = 1000;
+    private static final int BATCH_COMMIT_SIZE = 5000;
     private static final DateTimeFormatter DATETIME_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private static final DateTimeFormatter BATCH_FORMATTER = DateTimeFormatter.ofPattern("yyyyMM");
+    private static final String UPDATE_FEE_LIST_SQL =
+            "UPDATE ods.group_param " +
+                    "SET fee_list = ? " +
+                    "WHERE pid = ? AND batch_id = ?";
 
     private final DatabaseManager dbManager;
     private final String querySql = "SELECT pid,\n" +
@@ -41,13 +47,13 @@ public class DwdFeeProcessor implements DataProcessor {
             "FROM ods.dwd_fee_sum_group_mrhp\n" +
             "WHERE upload_time >= ?\n" +
             "  AND upload_time < ?\n" +
-            "ORDER BY upload_time, pid;";
+            "ORDER BY pid, config_id, upload_time;";
 
     private final String countSql =
             "SELECT COUNT(*) AS total\n" +
-            "FROM ods.dwd_fee_sum_group_mrhp\n" +
-            "WHERE upload_time >= ?\n" +
-            "  AND upload_time < ?";
+                    "FROM ods.dwd_fee_sum_group_mrhp\n" +
+                    "WHERE upload_time >= ?\n" +
+                    "  AND upload_time < ?";
 
     private final String mappingSql = "SELECT \n" +
             "       hos_project_code, \n" +
@@ -69,6 +75,10 @@ public class DwdFeeProcessor implements DataProcessor {
 
     private final Map<String, Map<String, Object>> mappingCache = new ConcurrentHashMap<>();
     private final String batchDate;
+
+    private String currentGroupKey = "";
+    private final List<Map<String, String>> currentGroupItems = new ArrayList<>();
+    private final List<Object[]> pendingGroupUpdates = new ArrayList<>(BATCH_COMMIT_SIZE);
 
     public DwdFeeProcessor(DatabaseManager dbManager) {
         this.dbManager = dbManager;
@@ -103,7 +113,6 @@ public class DwdFeeProcessor implements DataProcessor {
         log.info("开始执行 dwd_fee_sum_group 数据清洗");
         long startTime = System.currentTimeMillis();
 
-        // 获取总记录数
         LocalDate today = LocalDate.now();
         LocalDateTime rangeStart = today.minusDays(1).atStartOfDay();
         LocalDateTime rangeEnd = today.atStartOfDay();
@@ -113,31 +122,36 @@ public class DwdFeeProcessor implements DataProcessor {
             return;
         }
 
-        log.info("发现 {} 条数据需要处理，将按 {} 小时时间窗口顺序扫描", totalRows, QUERY_WINDOW_HOURS);
+        log.info("发现 {} 条数据需要处理", totalRows);
 
-        int processedRows = 0;
-        for (LocalDateTime windowStart = rangeStart;
-             windowStart.isBefore(rangeEnd);
-             windowStart = windowStart.plusHours(QUERY_WINDOW_HOURS)) {
-            LocalDateTime windowEnd = windowStart.plusHours(QUERY_WINDOW_HOURS);
-            if (windowEnd.isAfter(rangeEnd)) {
-                windowEnd = rangeEnd;
-            }
-            processedRows += processWindow(windowStart, windowEnd, processedRows);
+        int[] processedRows = {0};
+        try {
+            dbManager.querySqlStream(
+                    querySql,
+                    Arrays.asList(Timestamp.valueOf(rangeStart), Timestamp.valueOf(rangeEnd)),
+                    rawRow -> {
+                        processRow(rawRow);
+                        processedRows[0]++;
+                        if (processedRows[0] % 100000 == 0) {
+                            log.info("已处理 {} / {} 条记录", processedRows[0], totalRows);
+                        }
+                    }
+            );
+        } catch (Exception e) {
+            log.error("流式处理数据时发生异常", e);
+            throw new RuntimeException("数据处理失败", e);
         }
 
-        dbManager.executeAllBatch();
+        flushCurrentGroup();
+        flushGroupUpdates();
 
         long endTime = System.currentTimeMillis();
         log.info("dwd_fee_sum_group 数据清洗完成，共处理 {} 条记录，耗时 {}ms，平均速度 {} 条/秒",
-                processedRows,
+                processedRows[0],
                 (endTime - startTime),
-                (int)(processedRows * 1000.0 / (endTime - startTime + 1)));
+                (int) (processedRows[0] * 1000.0 / (endTime - startTime + 1)));
     }
 
-    /**
-     * 获取总记录数
-     */
     private int getTotalRowCount(LocalDateTime rangeStart, LocalDateTime rangeEnd) {
         try {
             List<Map<String, Object>> result = dbManager.querySql(
@@ -152,42 +166,6 @@ public class DwdFeeProcessor implements DataProcessor {
         } catch (Exception e) {
             log.error("获取总记录数失败", e);
             throw new RuntimeException(e);
-        }
-    }
-
-    /**
-     * 按时间窗口处理数据，避免大 OFFSET 扫描
-     */
-    private int processWindow(LocalDateTime windowStart, LocalDateTime windowEnd, int processedBase) {
-        try {
-            log.info("开始流式处理时间窗口 {} ~ {}", windowStart, windowEnd);
-
-            int[] windowProcessed = {0};
-            dbManager.querySqlStream(
-                    querySql,
-                    Arrays.asList(Timestamp.valueOf(windowStart), Timestamp.valueOf(windowEnd)),
-                    rawRow -> {
-                        processRow(rawRow);
-                        windowProcessed[0]++;
-                        int count = processedBase + windowProcessed[0];
-                        if (count % BATCH_COMMIT_SIZE == 0) {
-                            dbManager.executeAllBatch();
-                            log.info("已处理 {} 条记录", count);
-                        }
-                    }
-            );
-
-            if (windowProcessed[0] == 0) {
-                return 0;
-            }
-
-            log.info("完成时间窗口 {} ~ {} 的处理，共 {} 条",
-                    windowStart, windowEnd, windowProcessed[0]);
-
-            return windowProcessed[0];
-        } catch (Exception e) {
-            log.error("处理时间窗口 {} ~ {} 时发生异常", windowStart, windowEnd, e);
-            throw new RuntimeException("处理时间窗口数据失败", e);
         }
     }
 
@@ -237,16 +215,74 @@ public class DwdFeeProcessor implements DataProcessor {
         row.put("created_at", LocalDateTime.now().format(DATETIME_FORMATTER));
         cleanRow(row);
 
-        try {
-            dbManager.addBatch(TableEnum.cost_detail, row);
-        } catch (SQLException e) {
-            log.error("添加记录到批量处理时失败", e);
-            throw new RuntimeException(e);
-        }
+        collectFeeRow(row);
     }
 
     private String safeToString(Object obj) {
         return Objects.toString(obj, "");
+    }
+
+   private void collectFeeRow(Map<String, String> cleanedRow) {
+        Map<String, String> feeItem = buildFeeItem(cleanedRow);
+        String groupKey = feeItem.get("pid") + "|" + feeItem.get("batch_id");
+
+        if (!groupKey.equals(currentGroupKey)) {
+            flushCurrentGroup();
+            currentGroupKey = groupKey;
+        }
+        currentGroupItems.add(feeItem);
+    }
+    private void flushCurrentGroup() {
+        if (currentGroupItems.isEmpty()) {
+            return;
+        }
+
+        String[] keys = currentGroupKey.split("\\|", 2);
+        String pid = keys[0];
+        String batchId = keys[1];
+        String feeListJson = JSON.toJSONString(currentGroupItems);
+        pendingGroupUpdates.add(new Object[]{feeListJson, pid, batchId});
+        currentGroupItems.clear();
+
+        if (pendingGroupUpdates.size() >= BATCH_COMMIT_SIZE) {
+            flushGroupUpdates();
+        }
+    }
+
+    /**
+     * Executes one JDBC batch UPDATE for all accumulated groups, then clears the queue.
+     */
+    private void flushGroupUpdates() {
+        if (pendingGroupUpdates.isEmpty()) {
+            return;
+        }
+
+        try {
+            dbManager.batchUpdateFeeList(UPDATE_FEE_LIST_SQL, pendingGroupUpdates);
+            log.info("已写入 fee_list：{} 组", pendingGroupUpdates.size());
+        } catch (SQLException e) {
+            log.error("批量更新 group_param.fee_list 失败", e);
+            throw new RuntimeException("批量更新 fee_list 失败", e);
+        }
+        pendingGroupUpdates.clear();
+    }
+
+    /**
+     * Creates the JSON-ready copy of a cleaned row:
+     * - Replaces raw batch_id (config_id) with the UUID that group_param.batch_id holds.
+     * The UUID is derived from hosCode + "_" + rawBatchId, identical to what DatabaseManager
+     * computes when writing group_param rows, so the UPDATE WHERE clause matches correctly.
+     * - Removes hos_code (internal routing field, not part of the fee payload).
+     */
+    private Map<String, String> buildFeeItem(Map<String, String> cleanedRow) {
+        String hosCode = cleanedRow.get("hos_code");
+        String rawBatchId = cleanedRow.get("batch_id");
+        String uuidBatchId = StringToUUID.generateUUID(hosCode + "_" + rawBatchId);
+
+        Map<String, String> feeItem = new LinkedHashMap<>(cleanedRow);
+        feeItem.put("batch_id", uuidBatchId);
+        feeItem.remove("hos_code");
+        return feeItem;
     }
 
     public void cleanRow(Map<String, String> row) {
@@ -254,12 +290,11 @@ public class DwdFeeProcessor implements DataProcessor {
         Set<String> columnSet = new HashSet<>(Arrays.asList(columns));
         Iterator<Map.Entry<String, String>> iterator = row.entrySet().iterator();
 
-        while(iterator.hasNext()) {
-            Map.Entry<String, String> entry = (Map.Entry)iterator.next();
+        while (iterator.hasNext()) {
+            Map.Entry<String, String> entry = (Map.Entry) iterator.next();
             if (!"hos_code".equals(entry.getKey()) && !columnSet.contains(entry.getKey())) {
                 iterator.remove();
             }
         }
-
     }
 }
