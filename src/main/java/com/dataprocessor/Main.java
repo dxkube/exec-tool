@@ -27,10 +27,6 @@ public class Main {
     private static final Logger logger = LoggerFactory.getLogger(Main.class);
 
     public static void main(String[] args) throws Exception {
-        if (args.length != 0){
-            args[0] = "-table=dwd_fee_sum_group_mrhp";
-        }
-
         if (args[0].startsWith("-csv")){
             processFile( args);
         }else if (args[0].startsWith("-table")){
